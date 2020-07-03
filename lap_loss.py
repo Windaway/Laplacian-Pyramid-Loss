@@ -1,7 +1,9 @@
+from typing import Tuple, List
+
 import torch
 import torch.nn as nn
-from typing import Tuple, List
 import torch.nn.functional as F
+
 
 def gaussian(window_size, sigma):
     x = torch.arange(window_size).float() - window_size // 2
@@ -9,6 +11,7 @@ def gaussian(window_size, sigma):
         x = x + 0.5
     gauss = torch.exp((-x.pow(2.0) / float(2 * sigma ** 2)))
     return gauss / gauss.sum()
+
 
 def get_gaussian_kernel1d(kernel_size: int,
                           sigma: float,
@@ -22,6 +25,7 @@ def get_gaussian_kernel1d(kernel_size: int,
         )
     window_1d: torch.Tensor = gaussian(kernel_size, sigma)
     return window_1d
+
 
 def get_gaussian_kernel2d(
         kernel_size: Tuple[int, int],
@@ -46,6 +50,7 @@ def get_gaussian_kernel2d(
     )
     return kernel_2d
 
+
 def compute_padding(kernel_size: Tuple[int, int]) -> List[int]:
     assert len(kernel_size) == 2, kernel_size
     computed = [k // 2 for k in kernel_size]
@@ -54,6 +59,7 @@ def compute_padding(kernel_size: Tuple[int, int]) -> List[int]:
             computed[1],
             computed[0] - 1 if kernel_size[1] % 2 == 0 else computed[0],
             computed[0]]
+
 
 def filter2D(input: torch.Tensor, kernel: torch.Tensor,
              border_type: str = 'reflect') -> torch.Tensor:
@@ -93,43 +99,93 @@ def filter2D(input: torch.Tensor, kernel: torch.Tensor,
         return F.conv2d(input_pad.reshape(b * c, 1, hp, wp), tmp_kernel, padding=0, stride=1).view(b, c, h, w)
     return F.conv2d(input_pad, tmp_kernel.expand(c, -1, -1, -1), groups=c, padding=0, stride=1)
 
-def make_lp(img, kernel,max_levels,pad_type):
+
+def make_lp(img, kernel, max_levels, pad_type):
     current = img
     pyr = []
     for level in range(max_levels):
-        filtered = filter2D(current, kernel,pad_type)
+        filtered = filter2D(current, kernel, pad_type)
         diff = current - filtered
         pyr.append(diff)
         current = torch.nn.functional.avg_pool2d(filtered, 2)
     pyr.append(current)
     return pyr
 
+class inverse_huber_loss(nn.Module):
+    def __init__(self,):
+        super(inverse_huber_loss, self).__init__()
+    def forward(self, input, target):
+        absdiff = torch.abs(input-target)
+        C = 0.2*torch.max(absdiff).item()
+        return torch.mean(torch.where(absdiff < C, absdiff,(absdiff*absdiff+C*C)/(2*C) ))
+
 class lap_loss(nn.Module):
-    def __init__(self, max_levels=5, k_size=(5,5), sigma=(2.0,2.0),board_type='reflect',loss_type='L1'):
+    def __init__(self, max_levels=5, k_size=(5, 5), sigma=(2.0, 2.0), board_type='reflect', loss_type='IHuber',
+                 loss_multiplier=4,clip=False,clipmin=0.,clipmax=1.):
         super(lap_loss, self).__init__()
         self.max_levels = max_levels
         self.k_size = k_size
         self.sigma = sigma
-        self.board_type=board_type
+        self.board_type = board_type
         self._gauss_kernel = torch.unsqueeze(get_gaussian_kernel2d(k_size, sigma), dim=0)
+        self.clip=clip
+        self.clipmin = clipmin
+        self.clipmax = clipmax
+        loss_list: List[str] = ['L1', 'L2','IHuber']
+        self.loss_multiplier = loss_multiplier
+        if loss_type not in loss_list:
+            raise ValueError("Invalid loss_type, we expect the following: {0}."
+                             "Got: {1}".format(loss_list, loss_type))
+        self.loss_type = loss_type
+        if self.loss_type == 'L1':
+            self.loss = nn.L1Loss()
+        elif self.loss_type == 'L2':
+            self.loss = nn.MSELoss()
+        elif self.loss_type=='IHuber':
+            self.loss = inverse_huber_loss()
+
+    def forward(self, input, target):
+        if self.clip:
+            input=torch.clamp(input,self.clipmin,self.clipmax)
+        pyr_input = make_lp(input, self._gauss_kernel, self.max_levels, self.board_type)
+        pyr_target = make_lp(target, self._gauss_kernel, self.max_levels, self.board_type)
+        losses = []
+        mul = 1
+        for x in range(self.max_levels):
+            losses.append(mul * self.loss(pyr_input[x], pyr_target[x]))
+            mul *= self.loss_multiplier
+        return sum(losses)
+
+class grad_loss(nn.Module):
+    def __init__(self, loss_type='L1',clip=False,clipmin=0.,clipmax=1.):
+        super(grad_loss, self).__init__()
         loss_list: List[str] = ['L1', 'L2']
         if loss_type not in loss_list:
             raise ValueError("Invalid loss_type, we expect the following: {0}."
                              "Got: {1}".format(loss_list, loss_type))
-        self.loss_type=loss_type
-        if self.loss_type=='L1':
-            self.loss=nn.L1Loss()
-        elif self.loss_type=='L2':
+        self.loss_type = loss_type
+        if self.loss_type == 'L1':
+            self.loss = nn.L1Loss()
+        elif self.loss_type == 'L2':
             self.loss = nn.MSELoss()
+        self.clip=clip
+        self.clipmin = clipmin
+        self.clipmax = clipmax
 
     def forward(self, input, target):
-        pyr_input = make_lp(input, self._gauss_kernel, self.max_levels,self.board_type)
-        pyr_target = make_lp(target, self._gauss_kernel, self.max_levels,self.board_type)
-        return sum(self.loss(a, b) for a, b in zip(pyr_input, pyr_target))
+        if self.clip:
+            input=torch.clamp(input,self.clipmin,self.clipmax)
+        inputx_=input[:,:,0:-1,:]-input[:,:,1:,:]
+        inputy_=input[:,:,:,0:-1]-input[:,:,:,1:]
+        targetx_=target[:,:,0:-1,:]-target[:,:,1:,:]
+        targety_=target[:,:,:,0:-1]-target[:,:,:,1:]
+        loss=self.loss(inputx_,targetx_)+self.loss(inputy_,targety_)
+        return loss
 
 
-l=lap_loss(max_levels=2).cuda()
-a=torch.randn(5,3,128,128).cuda()
-b=torch.randn(5,3,128,128).cuda()
-c=l(a,b)
-print(c)
+if __name__ == '__main__':
+    l = grad_loss().cuda()
+    a = torch.randn(5, 3, 128, 128).cuda()
+    b = torch.randn(5, 3, 128, 128).cuda()
+    c = l(a, b)
+    print(c)
